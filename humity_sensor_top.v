@@ -1,263 +1,191 @@
 `timescale 1ns / 1ps
 
-module humity_sensor_top(
-    input clk,
+module top_sensor(
+    // global ports
+    input clk, 
     input rst,
     
+    // uart ports
+    input rx,
+    output tx,
+
+    // sensor
     input btn_start,
-    
     inout dht_io,
-    output [39:0] data,
-    output check
+
+    // fnd
+    output [7:0] seg,
+    output [3:0] seg_comm
     );
 
-    wire w_tick;
-
-    tick_generator u_tick(
-        .clk(clk),
-        .rst(rst),
-        .tick(w_tick)
-    );
-
-    sensor_cu u_cu(
-        // global signal
-        .clk(clk),
-        .rst(rst),
-        .tick(w_tick),
-        
-        // i/o
-        .start(btn_start),
+    wire [39:0] w_data;
+    reg [39:0] pipeline;
+    wire [39:0] w_pip;
+    assign w_pip = pipeline;
     
-        // sensor protocol signal
-        .dht(dht_io),
-        
-        // humity & temperature data
-        .data(data),
-        .check(check)
+    wire [7:0] ctl_data;
+    wire [7:0] w_ctl_data;
+    wire [7:0] odata;
+    wire w_start;
+    wire start;
+    wire en;
+    wire empty;
 
+    // data register to send fnd, uart
+    always @(posedge clk, posedge rst) begin
+        if (rst) begin
+            pipeline <= 0;
+        end
+        else begin
+            if (w_data != 0) pipeline <= w_data;
+            else pipeline <= pipeline;
+        end
+    end
+
+    top_module u_uart(
+        .clk(clk),
+        .reset(rst),
+        .rx(rx),
+        .tx(tx),
+        .en(en),
+        .cdata(ctl_data),
+        .odata(odata),
+        .empty(empty)
+    );
+
+    uart_cu u_cu(
+        .i_data(w_ctl_data),
+        .o_data(w_start)
+    );
+
+    btn_debounce u_btn(
+        .clk(clk),
+        .reset(rst),
+        .i_btn(btn_start),
+        .o_btn(start)
+    );
+
+    conti_data u_send(
+        .clk(clk),
+        .rst(rst),
+        .data(w_data),
+        .en(en),
+        .split_data(odata)
+    );
+
+    trigger u_tig(
+        .empty(empty),
+        .data(ctl_data),
+        .tig(w_ctl_data)
+    );
+
+    humity_sensor_top u_sensor(
+        .clk(clk),
+        .rst(rst),
+    
+        .btn_start(w_start|start),
+    
+        .dht_io(dht_io),
+        .data(w_data)
+    );
+
+    fnd_controller u_fnd(
+        .clk(clk),
+        .reset(rst),
+        .data({w_pip[39:32],w_pip[23:16]}),
+        .seg(seg),
+        .seg_comm(seg_comm)
     );
 endmodule
 
-module tick_generator #(
-    CNT = 1000 // 1us
-)(
-    input clk,
-    input rst,
-    output tick
-);
-    reg r_tick;
-    assign tick = r_tick; 
+// chagne ascii data to control data 
+module uart_cu(
+    input [7:0] i_data,
+    output o_data
+    );
+    
+    reg [4:0] r_data;
+    
+    assign o_data = r_data;
 
-    reg [$clog2(CNT)-1:0] cnt;
-
-    always @(posedge clk, posedge rst) begin
-        if (rst) begin
-            r_tick <= 0;
-            cnt <= 0;
-        end    
-        else begin
-            if (cnt == CNT-1) begin
-                cnt <= 0;
-                r_tick <= 1;
-            end
-            else begin
-                r_tick <= 0;
-                cnt <= cnt + 1;
-            end
-        end
+    always @(*) begin
+        case (i_data)
+            8'h72: r_data= 1; // r -> 0x72
+            default: r_data = 0;
+        endcase
     end
 endmodule
 
-module sensor_cu (
-    // global signal
+// transmit to 5 uart data
+module conti_data (
     input clk,
     input rst,
-    input tick,
-    // i/o
-    input start,
-    output [7:0] cstate,
-    // sensor protocol signal
-    inout dht,
-    // humity & temperature data
-    output [39:0] data,
-    output check
+    input [39:0] data,
+    output en,
+    output [7:0] split_data
 );
-    // parameter
-    localparam START_CNT = 1800, WAIT_CNT = 3, DATA_CNT = 3, STOP_CNT = 5, TIME_OUT = 2000,
-                LOW =5,RES_CNT =8;
-    // fsm
-    localparam IDLE = 0, START = 1, WAIT = 2, SYNC_LOW =3, SYNC_HIGH = 4, DATA_SRT = 5, 
-                DATA_SYNC = 6, STOP = 9, TICK = 10, DATA_CAL = 7, DATA_S = 8;
-    reg [3:0] state, next;
+    reg [39:0] mem_n, mem_r;
+    
+    // tx fifo write flag
+    reg en_r,en_n;
+    assign en = en_r;
 
-    // counter register
-    reg [$clog2(START_CNT)-1:0] tcnt_reg, tcnt_next;
-    reg [5:0] icnt_reg, icnt_next;
+    // output data
+    reg [7:0] o_data;
+    assign split_data = mem_r[39:32];
 
-    // led
-    assign check = (state == DATA_CAL);
-    // inout pin
-    assign dht = (state == START) ? 0 : 
-                ((state == IDLE)|(state == WAIT)) ? 1 : 1'bz;
+    // fsm register
+    localparam IDLE = 0, DATA1= 1;
+    reg state, next;
+    
 
-    // data register
-    reg [39:0] data_reg, data_next;
-    assign data = (state == TICK)? data_reg[39:0] : 0;
-
-    // edge_flag
-    reg flag_r, flag_n;
-
-    // fsm sync logic
     always @(posedge clk, posedge rst) begin
         if (rst) begin
             state <= 0;
-            tcnt_reg <= 0;
-            data_reg <= 0;
-            icnt_reg <= 6'd39;
-            flag_r <= 0;
-
+            mem_r <= 0;
+            en_r <= 0;
         end
         else begin
             state <= next;
-            tcnt_reg <= tcnt_next;
-            data_reg <= data_next;
-            icnt_reg <= icnt_next;
-            flag_r <= flag_n;
-            
+            mem_r <= mem_n;
+            en_r <= en_n;
         end
     end
 
-    // fsm state logic
     always @(*) begin
         next = state;
-        tcnt_next = tcnt_reg;
-        data_next = data_reg;
-        icnt_next = icnt_reg;
-        flag_n = flag_r;
-        
+        mem_n = mem_r;
+        en_n = en_r;
         case (state)
             IDLE: begin
-                flag_n = 0;
-                tcnt_next = 0;
-                icnt_next = 6'd39;
-                if (start) begin
-                    next = START;
+                en_n = 0;
+                mem_n = 0; 
+                if (|data) begin
+                    next = DATA1;
+                    mem_n = data;
+                    en_n = 1;
                 end
             end 
-            START: begin
-                if (tick) begin
-                    if (tcnt_reg == START_CNT-1) begin
-                        next = WAIT;
-                        tcnt_next = 0;
-                    end
-                    else begin
-                        tcnt_next = tcnt_reg + 1'b1;
-                    end
-                end
-            end
-            WAIT: begin
-                if (tick) begin
-                    if (tcnt_reg == WAIT_CNT-1) begin
-                        next = SYNC_LOW;
-                        tcnt_next = 0;
-                    end
-                    else begin
-                        tcnt_next = tcnt_reg + 1'b1;
-                    end
-                end
-            end
-            SYNC_LOW: begin
-                if (tick) begin
-                    if (dht) begin
-                        next = SYNC_HIGH;
-                    end
-                /*if (dht & tcnt_reg > LOW-1) begin
-                    next = SYNC_HIGH;
-                    tcnt_next = 0;
+            DATA1: begin
+                if(mem_n[31:0] == 0) begin
+                    next = IDLE;
+                    en_n = 0;
+                    mem_n = 0;
                 end
                 else begin
-                    tcnt_next = tcnt_reg + 1;
-                end*/
+                    mem_n = {mem_r[31:0],8'b0};
                 end
             end
-            SYNC_HIGH: begin
-                if (tick) begin
-                    if (~dht) begin
-                        next = DATA_SRT;
-                    end
-                end
-                /*if (~dht & tcnt_reg > RES_CNT-1 ) begin
-                    next = DATA_SRT;
-                    tcnt_next = 0;
-                end
-                else begin
-                    tcnt_next = tcnt_reg + 1;
-                end*/
-            end
-            DATA_SRT: begin
-                if (TICK) begin
-                    if (dht) begin
-                        next = DATA_SYNC;
-                    end
-                end
-            end
-            DATA_SYNC: begin
-                if (tick) begin
-                    if (dht) begin
-                        tcnt_next = tcnt_reg + 1;
-                    end
-                    else begin
-                        next = DATA_CAL;
-                    end
-                end
-                if (flag_r == 1) begin
-                    flag_n = 0;
-                    icnt_next = icnt_reg - 1'b1;
-                end
-                
-            end
-            DATA_CAL: begin
-                if (tick) begin
-                if (tcnt_reg < DATA_CNT) begin
-                    data_next[icnt_reg] = 0; 
-                    next = DATA_S;
-                    tcnt_next = 0; 
-                end
-                else begin
-                    data_next[icnt_reg] = 1; 
-                    next = DATA_S;
-                    tcnt_next = 0;
-                end
-                end
-            end
-            DATA_S: begin
-                if (tick) begin
-                if (dht) begin
-                    next = DATA_SYNC;
-                    flag_n = 1;
-                end
-                else begin
-                    if (icnt_reg == 0) begin
-                        next = STOP;
-                        tcnt_next = 0;
-                    end
-                end
-                end
-            end
-            STOP: begin // sensor stop
-                if (tick) begin
-                    if (tcnt_reg == STOP_CNT) begin
-                        next = TICK;
-                    end
-                    else begin
-                        tcnt_next = tcnt_reg + 1;
-                    end
-                end
-            end
-            TICK: begin // data 
-                next = IDLE;
-            end
+            default: mem_n = 0;
         endcase
     end
+endmodule
 
+// trigger generator
+module trigger (
+    input empty,
+    input [7:0] data,
+    output [7:0] tig
+);
+    assign tig = empty? 0: data;
 endmodule
